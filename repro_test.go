@@ -1,14 +1,22 @@
-// Package testdym1_39 is an integration test that demonstrates the 1.39-dev
-// nested CGo segfault during on_http_filter_config_new on macOS.
+// Package testdym1_39 is an integration test that demonstrates the Envoy 1.39-dev
+// segfault when a Go dynamic module calls back into Envoy (DefineCounter,
+// DefineGauge, DefineHistogram) during on_http_filter_config_new on macOS.
 //
 // Two test cases:
-//   TestSafeFilter  -- no C callback in Create -- passes on both versions
-//   TestCrashFilter -- DefineCounter in Create -- passes on 1.38, crashes 1.39-dev
+//   TestSafeFilter: no C callback in Create, passes on both versions
+//   TestCrashFilter: DefineCounter in Create, passes on 1.38, crashes 1.39-dev macOS
 //
-// Prerequisites:
-//   go test -v -run TestSafeFilter   ENVOY_BIN=<path>
-//   make run-138   # runs both with 1.38.0 (expect: both PASS)
-//   make run-139   # runs both with 1.39-dev (expect: safe PASS, crash FAIL/segfault)
+// Environment variables:
+//   ENVOY_BIN   path to envoy binary (default: .bin/envoy-138/envoy)
+//   ENVOY_YAML  which config to load (default: envoy.yaml = both filters)
+//               use envoy-safe.yaml to load only safe-filter (no crash risk)
+//
+// Build libtestdym.so before running: make build
+//
+// CI usage:
+//   make run-138              # both PASS
+//   make run-139-safe         # safe=PASS (1.39-dev, safe-only config)
+//   make run-139-crash        # crash=SEGFAULT (1.39-dev, expected failure)
 package testdym1_39
 
 import (
@@ -30,39 +38,35 @@ const (
 )
 
 var (
-	envoyCmd  *exec.Cmd
-	soDir     string
+	envoyCmd   *exec.Cmd
+	configPath string
 )
 
 func TestMain(m *testing.M) {
 	_, file, _, _ := runtime.Caller(0)
 	root := filepath.Dir(file)
-	soDir = root
 
-	bin := envoyBin()
+	bin := envoyBin(root)
 	if _, err := os.Stat(bin); err != nil {
 		fmt.Fprintf(os.Stderr, "SKIP: envoy not found at %s\n", bin)
 		os.Exit(0)
 	}
 
 	soPath := filepath.Join(root, "libtestdym.so")
-	if os.Getenv("SKIP_BUILD") == "" {
-		fmt.Fprintln(os.Stderr, "building libtestdym.so ...")
-		cmd := exec.Command("go", "build", "-trimpath", "-buildmode=c-shared",
-			"-o", soPath, "./filter")
-		cmd.Dir = root
-		cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
-		cmd.Stdout = os.Stderr
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "build failed: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Fprintln(os.Stderr, "build OK")
+	if _, err := os.Stat(soPath); err != nil {
+		fmt.Fprintf(os.Stderr, "libtestdym.so not found: run make build\n")
+		os.Exit(1)
 	}
 
+	cfg := os.Getenv("ENVOY_YAML")
+	if cfg == "" {
+		cfg = "envoy.yaml"
+	}
+	configPath = filepath.Join(root, cfg)
+	fmt.Fprintf(os.Stderr, "config: %s\n", configPath)
+
 	envoyCmd = exec.Command(bin,
-		"-c", filepath.Join(root, "envoy.yaml"),
+		"-c", configPath,
 		"--log-level", "warning",
 		"--component-log-level", "dynamic_modules:info",
 	)
@@ -79,11 +83,10 @@ func TestMain(m *testing.M) {
 	}
 	fmt.Fprintf(os.Stderr, "envoy pid=%d\n", envoyCmd.Process.Pid)
 
-	if !waitReady(15 * time.Second) {
+	if !waitReady(20 * time.Second) {
 		envoyCmd.Process.Kill()
 		fmt.Fprintln(os.Stderr, "envoy not ready in time (crashed during load?)")
-		// Report the failure here so the test output is clear.
-		fmt.Fprintln(os.Stderr, "HINT: on 1.39-dev this is the expected crash from DefineCounter in on_http_filter_config_new")
+		fmt.Fprintln(os.Stderr, "HINT: on 1.39-dev macOS, crash-filter triggers runtime.sigfwdgo at 0x0 via DefineCounter in on_http_filter_config_new")
 		os.Exit(2)
 	}
 	fmt.Fprintln(os.Stderr, "envoy ready")
@@ -94,12 +97,12 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// TestSafeFilter verifies that a filter with no C callback in Create works.
-// Expected: PASS on both 1.38.0 and 1.39-dev.
+// TestSafeFilter verifies a filter with no C callback in Create.
+// Expected: PASS on 1.38.0 and 1.39-dev (both configs).
 func TestSafeFilter(t *testing.T) {
 	resp, err := http.Get(safeAddr + "/ping")
 	if err != nil {
-		t.Fatalf("GET /ping: %v", err)
+		t.Fatalf("GET safe-filter: %v", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -111,14 +114,19 @@ func TestSafeFilter(t *testing.T) {
 	}
 }
 
-// TestCrashFilter verifies that a filter calling DefineCounter in Create works.
-// Expected: PASS on 1.38.0, CRASH/FAIL on 1.39-dev macOS.
-// The crash manifests as Envoy dying during load (TestMain exits with code 2
-// before this test runs) or as a connection error here.
+// TestCrashFilter verifies a filter calling DefineCounter in Create.
+// Expected: PASS on 1.38.0, CRASH on 1.39-dev macOS.
+// With envoy-safe.yaml the test is skipped (crash-filter not loaded).
+// The crash manifests as Envoy dying during load; TestMain exits with
+// code 2 before this test is reached.
 func TestCrashFilter(t *testing.T) {
+	cfg := os.Getenv("ENVOY_YAML")
+	if cfg == "envoy-safe.yaml" {
+		t.Skip("crash-filter not loaded in envoy-safe.yaml")
+	}
 	resp, err := http.Get(crashAddr + "/ping")
 	if err != nil {
-		t.Fatalf("GET /ping (crash filter port): %v -- on 1.39-dev this is the segfault from DefineCounter in on_http_filter_config_new", err)
+		t.Fatalf("GET crash-filter: %v (on 1.39-dev macOS this follows the segfault from DefineCounter in on_http_filter_config_new)", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -130,13 +138,11 @@ func TestCrashFilter(t *testing.T) {
 	}
 }
 
-func envoyBin() string {
+func envoyBin(root string) string {
 	if b := os.Getenv("ENVOY_BIN"); b != "" {
 		return b
 	}
-	// default to 1.38.0 via func-e
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".func-e", "versions", "1.38.0", "bin", "envoy")
+	return filepath.Join(root, ".bin", "envoy-138", "envoy")
 }
 
 func waitReady(timeout time.Duration) bool {
